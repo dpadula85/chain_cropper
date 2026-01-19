@@ -120,6 +120,12 @@ Examples:
   # Remove all side chains (max-length 0)
   chain-cropper input.pdb -o output.xyz --max-length 0
   
+  # Process trajectory with 8 parallel workers
+  chain-cropper input.gro input.xtc -o output.xtc --workers 8
+  
+  # Disable progress bar
+  chain-cropper input.gro input.xtc -o output.xtc --no-progress
+  
   # Batch process all files in current directory
   chain-cropper --batch -o results/
   
@@ -146,6 +152,12 @@ Examples:
     parser.add_argument('--cap-distance', type=float, default=1.09,
                        help='Distance for capping hydrogens in Angstrom (default: 1.09)')
     
+    # Performance options
+    parser.add_argument('--workers', type=int, default=None,
+                       help='Number of parallel workers for trajectory processing (default: CPU count - 1)')
+    parser.add_argument('--no-progress', action='store_true',
+                       help='Disable progress bar')
+    
     # Mode options
     parser.add_argument('--batch', action='store_true',
                        help='Process all topology files in current directory')
@@ -166,7 +178,8 @@ Examples:
 
 def process_single_file(topology_path: Path, trajectory_path: Optional[Path],
                        output_path: Path, chain_type: str, max_length: int,
-                       cap_distance: float) -> bool:
+                       cap_distance: float, n_workers: Optional[int],
+                       show_progress: bool) -> bool:
     """
     Process a single file or file pair.
     
@@ -184,6 +197,10 @@ def process_single_file(topology_path: Path, trajectory_path: Optional[Path],
         Maximum chain length
     cap_distance : float
         Capping distance
+    n_workers : Optional[int]
+        Number of parallel workers
+    show_progress : bool
+        Show progress bar
         
     Returns
     -------
@@ -210,10 +227,16 @@ def process_single_file(topology_path: Path, trajectory_path: Optional[Path],
         processor = TrajectoryProcessor(cropper)
         
         # Process
+        if n_workers is not None:
+            logger.info(f"Using {n_workers} parallel workers")
+        
         logger.info(f"Processing with chain_type={chain_type}, "
                    f"max_length={max_length}")
+        
         processor.process_trajectory(universe, str(output_path), 
-                                   chain_type, max_length)
+                                   chain_type, max_length,
+                                   n_workers=n_workers,
+                                   show_progress=show_progress)
         
         logger.info(f"Successfully written to {output_path}")
         return True
@@ -224,7 +247,8 @@ def process_single_file(topology_path: Path, trajectory_path: Optional[Path],
 
 
 def process_batch(output_directory: Path, chain_type: str, max_length: int,
-                 cap_distance: float) -> int:
+                 cap_distance: float, n_workers: Optional[int],
+                 show_progress: bool) -> int:
     """
     Process all topology files in current directory.
     
@@ -238,6 +262,10 @@ def process_batch(output_directory: Path, chain_type: str, max_length: int,
         Maximum chain length
     cap_distance : float
         Capping distance
+    n_workers : Optional[int]
+        Number of parallel workers
+    show_progress : bool
+        Show progress bar
         
     Returns
     -------
@@ -267,7 +295,8 @@ def process_batch(output_directory: Path, chain_type: str, max_length: int,
         logger.info(f"Processing {topo_file.name} -> {output_file}")
         
         if process_single_file(topo_file, None, output_path, 
-                              chain_type, max_length, cap_distance):
+                              chain_type, max_length, cap_distance,
+                              n_workers, show_progress):
             successful += 1
     
     logger.info(f"Batch processing complete: {successful}/{len(topology_files)} successful")
@@ -318,6 +347,11 @@ def validate_arguments(args: argparse.Namespace) -> None:
     if args.cap_distance <= 0:
         print("Error: cap-distance must be positive")
         sys.exit(1)
+    
+    # Validate workers
+    if args.workers is not None and args.workers < 1:
+        print("Error: workers must be at least 1")
+        sys.exit(1)
 
 
 def main() -> int:
@@ -344,12 +378,16 @@ def main() -> int:
     
     logger.info("Starting ChainCropper")
     
+    # Determine progress bar setting
+    show_progress = not args.no_progress
+    
     try:
         if args.batch:
             # Batch processing mode
             output_directory = Path(args.output)
             successful = process_batch(output_directory, args.chain_type, 
-                                     args.max_length, args.cap_distance)
+                                     args.max_length, args.cap_distance,
+                                     args.workers, show_progress)
             
             if successful == 0:
                 logger.error("No files processed successfully")
@@ -363,7 +401,8 @@ def main() -> int:
             
             success = process_single_file(topology_path, trajectory_path,
                                         output_path, args.chain_type,
-                                        args.max_length, args.cap_distance)
+                                        args.max_length, args.cap_distance,
+                                        args.workers, show_progress)
             
             if not success:
                 return 1

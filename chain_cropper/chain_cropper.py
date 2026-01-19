@@ -11,7 +11,70 @@ import argparse
 import numpy as np
 import MDAnalysis as mda
 from pathlib import Path
+import multiprocessing as mp
 from typing import List, Optional, Tuple, Union, Dict, Set
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
+
+def _process_frame_worker(frame_idx: int, positions: np.ndarray, 
+                          keep_indices: List[int], replace_info: List[Tuple[int, int]],
+                          cap_distance: float, types: np.ndarray, 
+                          names: np.ndarray) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Worker function to process a single frame.
+    
+    Parameters
+    ----------
+    frame_idx : int
+        Frame index for ordering
+    positions : np.ndarray
+        Atomic positions for this frame
+    keep_indices : List[int]
+        Indices of atoms to keep
+    replace_info : List[Tuple[int, int]]
+        List of (anchor_idx, deleted_idx) pairs for capping
+    cap_distance : float
+        Distance for hydrogen caps
+    types : np.ndarray
+        Atom types array
+    names : np.ndarray
+        Atom names array
+        
+    Returns
+    -------
+    Tuple[int, np.ndarray, np.ndarray, np.ndarray]
+        Frame index, positions, types, and names for kept atoms
+    """
+    coords = positions.copy()
+    elements = types.copy()
+    atom_names = names.copy()
+    
+    # Apply hydrogen capping
+    for anchor_idx, deleted_idx in replace_info:
+        anchor_pos = coords[anchor_idx]
+        old_pos = coords[deleted_idx]
+        
+        # Calculate new hydrogen position
+        bond_vector = old_pos - anchor_pos
+        bond_vector = bond_vector / np.linalg.norm(bond_vector)
+        new_h_pos = anchor_pos + bond_vector * cap_distance
+        
+        coords[deleted_idx] = new_h_pos
+        elements[deleted_idx] = 'H'
+        atom_names[deleted_idx] = 'H'
+    
+    # Extract only kept atoms
+    final_coords = coords[keep_indices]
+    final_types = elements[keep_indices]
+    final_names = atom_names[keep_indices]
+    
+    return frame_idx, final_coords, final_types, final_names
 
 
 class ChainCropper:
@@ -373,9 +436,10 @@ class ChainCropper:
 class TrajectoryProcessor:
     """
     Handler for processing trajectories with chain cropping.
+    Optimized with connectivity caching and parallel frame processing.
     """
     
-    def __init__(self, cropper: ChainCropper):
+    def __init__(self, cropper):
         """
         Initialize with a ChainCropper instance.
         
@@ -385,11 +449,13 @@ class TrajectoryProcessor:
             ChainCropper instance to use for processing
         """
         self.cropper = cropper
+        self._cached_topology = None
     
     def process_trajectory(self, universe: mda.Universe, output_path: str,
-                          chain_type: str = 'alkyl', max_chain_length: int = 1) -> None:
+                          chain_type: str = 'alkyl', max_chain_length: int = 1,
+                          n_workers: int = None, show_progress: bool = True) -> None:
         """
-        Process entire trajectory and write to file.
+        Process entire trajectory and write to file with parallelization.
         
         Parameters
         ----------
@@ -401,40 +467,189 @@ class TrajectoryProcessor:
             Type of chains to crop
         max_chain_length : int, default=1
             Maximum chain length to keep
+        n_workers : int, optional
+            Number of parallel workers. If None, uses CPU count - 1
+        show_progress : bool, default=True
+            Show progress bar during processing
         """
-        # Process first frame to determine structure
-        universe.trajectory[0]
-        cropped_universe = self.cropper.crop_chains(universe, chain_type, max_chain_length)
-        
         # Determine output format
         output_path = Path(output_path)
         extension = output_path.suffix.lower()
         
+        # Process first frame to determine topology (connectivity computed once)
+        universe.trajectory[0]
+        keep_indices, delete_indices, replace_indices = self.cropper.identify_chains_to_crop(
+            universe, chain_type, max_chain_length)
+        
+        # Cache topology information
+        self._cache_topology(universe, keep_indices, replace_indices, delete_indices)
+        
         if extension in ['.xtc', '.trr', '.dcd']:
-            self._write_trajectory(universe, cropped_universe, output_path, 
-                                 chain_type, max_chain_length)
+            self._write_trajectory_parallel(universe, output_path, n_workers, show_progress)
         elif extension in ['.xyz', '.gro', '.pdb']:
-            self._write_single_frame(cropped_universe, output_path)
+            self._write_single_frame(universe, output_path)
         else:
             raise ValueError(f"Unsupported output format: {extension}")
     
-    def _write_trajectory(self, original_universe: mda.Universe, 
-                         template_universe: mda.Universe, output_path: Path,
-                         chain_type: str, max_chain_length: int) -> None:
-        """Write trajectory file."""
-        n_atoms = len(template_universe.atoms)
+    def _cache_topology(self, universe: mda.Universe, keep_indices: List[int],
+                       replace_indices: List[int], delete_indices: List[int]) -> None:
+        """
+        Cache topology information from first frame for reuse.
+        
+        Parameters
+        ----------
+        universe : mda.Universe
+            Universe object
+        keep_indices : List[int]
+            Atoms to keep
+        replace_indices : List[int]
+            Atoms that need hydrogen caps
+        delete_indices : List[int]
+            Atoms to delete
+        """
+        # Build replacement information: (anchor_atom, deleted_atom) pairs
+        replace_info = []
+        atoms_to_keep = set(keep_indices)
+        
+        for atom_idx in replace_indices:
+            connected = self.cropper.connectivity[atom_idx]
+            connected_atoms = [idx for idx in connected if idx >= 0]
+            
+            deleted_connected = [idx for idx in connected_atoms if idx in delete_indices]
+            if deleted_connected:
+                replace_info.append((atom_idx, deleted_connected[0]))
+        
+        # Update keep_indices to include capped hydrogens
+        final_keep_set = set(keep_indices)
+        for _, deleted_idx in replace_info:
+            final_keep_set.add(deleted_idx)
+        
+        final_keep_indices = sorted(list(final_keep_set))
+        
+        self._cached_topology = {
+            'keep_indices': final_keep_indices,
+            'replace_info': replace_info,
+            'types': universe.atoms.types.copy(),
+            'names': universe.atoms.names.copy()
+        }
+    
+    def _write_trajectory_parallel(self, universe: mda.Universe, 
+                                   output_path: Path, n_workers: int = None,
+                                   show_progress: bool = True) -> None:
+        """
+        Write trajectory file using parallel processing.
+        
+        Parameters
+        ----------
+        universe : mda.Universe
+            Input universe
+        output_path : Path
+            Output file path
+        n_workers : int, optional
+            Number of workers
+        show_progress : bool, default=True
+            Show progress bar
+        """
+        if n_workers is None:
+            n_workers = max(1, mp.cpu_count() - 1)
+        
+        n_frames = len(universe.trajectory)
+        keep_indices = self._cached_topology['keep_indices']
+        replace_info = self._cached_topology['replace_info']
+        cap_distance = self.cropper.cap_distance
+        types = self._cached_topology['types']
+        names = self._cached_topology['names']
+        
+        # Collect all positions from trajectory
+        all_positions = []
+        
+        if show_progress and TQDM_AVAILABLE:
+            pbar_load = tqdm(universe.trajectory, desc="Loading frames", unit="frame")
+            for ts in pbar_load:
+                all_positions.append(universe.atoms.positions.copy())
+        else:
+            for ts in universe.trajectory:
+                all_positions.append(universe.atoms.positions.copy())
+        
+        # Process frames in parallel
+        frame_results = [None] * n_frames
+        
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {}
+            for frame_idx in range(n_frames):
+                future = executor.submit(
+                    _process_frame_worker,
+                    frame_idx,
+                    all_positions[frame_idx],
+                    keep_indices,
+                    replace_info,
+                    cap_distance,
+                    types,
+                    names
+                )
+                futures[future] = frame_idx
+            
+            # Collect results maintaining order with progress bar
+            if show_progress and TQDM_AVAILABLE:
+                pbar_process = tqdm(total=n_frames, desc="Processing frames", unit="frame")
+                for future in as_completed(futures):
+                    frame_idx, coords, frame_types, frame_names = future.result()
+                    frame_results[frame_idx] = (coords, frame_types, frame_names)
+                    pbar_process.update(1)
+                pbar_process.close()
+            else:
+                for future in as_completed(futures):
+                    frame_idx, coords, frame_types, frame_names = future.result()
+                    frame_results[frame_idx] = (coords, frame_types, frame_names)
+        
+        # Write trajectory in order
+        n_atoms = len(keep_indices)
         
         with mda.Writer(str(output_path), n_atoms) as writer:
-            for ts in original_universe.trajectory:
-                # Process current frame
-                frame_universe = self.cropper.crop_chains(
-                    original_universe, chain_type, max_chain_length)
-                writer.write(frame_universe.atoms)
+            # Create temporary universe for writing
+            temp_u = mda.Universe.empty(n_atoms, trajectory=True)
+            temp_u.add_TopologyAttr('type', frame_results[0][1])
+            temp_u.add_TopologyAttr('name', frame_results[0][2])
+            
+            if show_progress and TQDM_AVAILABLE:
+                pbar_write = tqdm(frame_results, desc="Writing trajectory", unit="frame")
+                for coords, frame_types, frame_names in pbar_write:
+                    temp_u.atoms.positions = coords
+                    writer.write(temp_u.atoms)
+            else:
+                for coords, frame_types, frame_names in frame_results:
+                    temp_u.atoms.positions = coords
+                    writer.write(temp_u.atoms)
     
     def _write_single_frame(self, universe: mda.Universe, output_path: Path) -> None:
-        """Write single frame file."""
-        extension = output_path.suffix.lower()
-        universe.atoms.write(str(output_path))
+        """Write single frame file using cached topology."""
+        keep_indices = self._cached_topology['keep_indices']
+        replace_info = self._cached_topology['replace_info']
+        
+        coords = universe.atoms.positions.copy()
+        elements = self._cached_topology['types'].copy()
+        atom_names = self._cached_topology['names'].copy()
+        
+        # Apply hydrogen capping
+        for anchor_idx, deleted_idx in replace_info:
+            anchor_pos = coords[anchor_idx]
+            old_pos = coords[deleted_idx]
+            
+            bond_vector = old_pos - anchor_pos
+            bond_vector = bond_vector / np.linalg.norm(bond_vector)
+            new_h_pos = anchor_pos + bond_vector * self.cropper.cap_distance
+            
+            coords[deleted_idx] = new_h_pos
+            elements[deleted_idx] = 'H'
+            atom_names[deleted_idx] = 'H'
+        
+        # Create new universe with kept atoms
+        temp_u = mda.Universe.empty(len(keep_indices), trajectory=True)
+        temp_u.add_TopologyAttr('type', elements[keep_indices])
+        temp_u.add_TopologyAttr('name', atom_names[keep_indices])
+        temp_u.atoms.positions = coords[keep_indices]
+        
+        temp_u.atoms.write(str(output_path))
     
 if __name__ == '__main__':
     pass
