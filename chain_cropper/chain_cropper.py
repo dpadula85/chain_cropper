@@ -502,6 +502,7 @@ class TrajectoryProcessor(ChainCropper):
             
             deleted_connected = [idx for idx in connected_atoms 
                                if idx in self.delete_indices]
+
             if deleted_connected:
                 # Use the first deleted connection for positioning
                 deleted_atom = deleted_connected[0]
@@ -524,8 +525,8 @@ class TrajectoryProcessor(ChainCropper):
         
         # Update universe temporarily
         universe.atoms.positions = coords
-        universe.atoms.types = elements
-        universe.atoms.names = names
+        universe.add_TopologyAttr('name', names)
+        universe.add_TopologyAttr('element', elements)
         
         # Create new universe with selected atoms
         selection = universe.select_atoms(
