@@ -35,12 +35,12 @@ Python API — `ChainCropper(cap_distance=1.09)`:
   index lists.
 - **`crop_chains(universe, chain_type='alkyl', max_chain_length=1)`
   returns a 3-tuple `(new_universe, keep, replace)`, not a bare
-  `mda.Universe`** — its own docstring (line ~309) only documents the
-  `mda.Universe` return, which is misleading and is exactly what caused
-  the `crystal_analyzer` tuple-unpacking bug this session (its `__init__`
+  `mda.Universe`** — its docstring originally only documented the
+  `mda.Universe` return, which is exactly what caused the
+  `crystal_analyzer` tuple-unpacking bug this session (its `__init__`
   and `export_dimers()` both originally assumed a bare `Universe`; see
-  `crystal_analyzer`'s own CLAUDE.md). Consider correcting this docstring
-  so future callers aren't misled the same way.
+  `crystal_analyzer`'s own CLAUDE.md). **Fixed 2026-08-06:** docstring
+  and return type hint corrected to document the actual 3-tuple return.
 
 `TrajectoryProcessor(ChainCropper)` — reuses cropping indices computed
 once from the topology across all trajectory frames;
@@ -82,9 +82,9 @@ output path's extension.
   `oligomer_builder`, which silently no-op on that branch) — if those
   packages' ether support is ever needed for real, this module is the
   reference implementation to port from, not the other way round.
-- `setup.py`'s `install_requires` lists only `MDAnalysis`/`numpy`, but
-  `tqdm` and `joblib` are hard runtime imports (`_write_trajectory`,
-  `process_trajectory`) — worth adding both to `install_requires`.
+- **Fixed 2026-08-06:** `setup.py`'s `install_requires` listed only
+  `MDAnalysis`/`numpy`, but `tqdm` and `joblib` are hard runtime imports
+  (`_write_trajectory`, `process_trajectory`) — added both.
 
 ## Dependencies
 
