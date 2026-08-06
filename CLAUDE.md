@@ -76,6 +76,27 @@ output path's extension.
 
 ## Known gaps / TODOs
 
+- **Real bug, fixed 2026-08-06: the unit cell was dropped.** Both
+  `crop_chains` and `_apply_cropping` build the cropped structure with
+  `mda.Merge`, which does not carry the box over, and nothing restored
+  it. Every cropped structure therefore came out with **no box at all**
+  (`PM6_16mer_n20_cropped.gro` ends in `0.00000 0.00000 0.00000` and
+  loads as `dimensions=None`), and it propagated: the cropped trajectory
+  and every frame sampled from it were unitless too. Any PBC-aware
+  calculation downstream was silently non-periodic — which matters
+  directly for finding non-covalent contacts across a periodic box.
+  Fixed by setting `new_universe.dimensions = universe.dimensions` at
+  both `mda.Merge` sites. The parallel trajectory path additionally
+  discarded per-frame boxes entirely (`_process_frame` returns only
+  coordinates/elements/names), so the box is now collected per frame
+  alongside the coordinates and restored before each write. **Per-frame
+  boxes are used for trajectory frames, never the structure file's box** —
+  under NPT the cell fluctuates, so reusing the structure's box for every
+  frame would be wrong. Verified on a synthetic 3-frame trajectory with a
+  deliberately different box each frame, serial and parallel paths alike.
+  **Note: cropped files produced before this fix carry no box and should
+  be regenerated** if anything PBC-aware is to be done with them.
+
 - **Investigated, did not reproduce:** the previously-flagged
   "`add_TopologyAttr` crash in the serial (`-j 1`) trajectory path"
   (repeated `_apply_cropping()` calls on the same `Universe` across

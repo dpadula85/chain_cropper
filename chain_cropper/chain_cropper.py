@@ -369,7 +369,10 @@ class ChainCropper:
         # Create new universe with selected atoms
         selection = universe.select_atoms(f'index {" ".join(map(str, keep_indices))}')
         new_universe = mda.Merge(selection)
-        
+
+        # mda.Merge does not carry the unit cell over (see _apply_cropping).
+        new_universe.dimensions = universe.dimensions
+
         return new_universe, keep, replace
 
 
@@ -544,7 +547,15 @@ class TrajectoryProcessor(ChainCropper):
             f'index {" ".join(map(str, keep_indices_sorted))}'
         )
         new_universe = mda.Merge(selection)
-        
+
+        # mda.Merge does not carry the unit cell over, so without this the
+        # cropped structure comes out with no box at all and every
+        # PBC-aware calculation downstream silently becomes non-periodic.
+        # universe.dimensions is the box of the frame currently loaded, so
+        # this picks up that frame's box when called from the trajectory
+        # loop, and the structure's own box when called on a structure.
+        new_universe.dimensions = universe.dimensions
+
         return new_universe
     
     def _process_frame(self, frame_idx: int, coords: np.ndarray, 
@@ -646,12 +657,19 @@ class TrajectoryProcessor(ChainCropper):
             # First, load all coordinates into memory
             print("Loading trajectory into memory...")
             all_coords = []
+            all_dimensions = []
             elements = universe.atoms.types.copy()
             names = universe.atoms.names.copy()
-            
-            for ts in tqdm(universe.trajectory, total=n_frames, 
+
+            for ts in tqdm(universe.trajectory, total=n_frames,
                           desc="Loading frames", unit="frame"):
                 all_coords.append(universe.atoms.positions.copy())
+                # Each frame keeps its own box: under NPT the cell
+                # fluctuates, so the structure file's box must not be
+                # reused for every frame.
+                all_dimensions.append(
+                    None if ts.dimensions is None else ts.dimensions.copy()
+                )
             
             # Process frames in parallel
             print(f"Processing frames in parallel with {n_jobs} workers...")
@@ -673,12 +691,16 @@ class TrajectoryProcessor(ChainCropper):
                 temp_u.add_TopologyAttr('type', processed_frames[0][1])
                 temp_u.add_TopologyAttr('name', processed_frames[0][2])
                 
-                for coords, elements, names in tqdm(processed_frames, 
-                                                   desc="Writing frames", 
-                                                   unit="frame"):
+                for (coords, elements, names), dimensions in tqdm(
+                        zip(processed_frames, all_dimensions),
+                        total=len(processed_frames),
+                        desc="Writing frames", unit="frame"):
                     temp_u.atoms.positions = coords
                     temp_u.atoms.types = elements
                     temp_u.atoms.names = names
+                    # Restore this frame's own box before writing it.
+                    if dimensions is not None:
+                        temp_u.dimensions = dimensions
                     writer.write(temp_u.atoms)
         
         print(f"Trajectory written to {output_path}")
