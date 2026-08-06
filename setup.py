@@ -32,6 +32,8 @@ setup(
     install_requires=[
         'MDAnalysis>=2.0.0',
         'numpy>=1.19.0',
+        'tqdm',
+        'joblib',
     ],
     entry_points={
         'console_scripts': [

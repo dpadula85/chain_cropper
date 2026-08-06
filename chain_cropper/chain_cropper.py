@@ -305,7 +305,7 @@ class ChainCropper:
         return list(final_keep_atoms), list(all_atoms_to_delete), replace_atoms
 
     def crop_chains(self, universe: mda.Universe, chain_type: str = 'alkyl',
-                   max_chain_length: int = 1) -> mda.Universe:
+                   max_chain_length: int = 1) -> Tuple[mda.Universe, List[int], List[int]]:
         """
         Crop side chains from a universe.
         
@@ -317,11 +317,13 @@ class ChainCropper:
             Type of chains to crop
         max_chain_length : int, default=1
             Maximum chain length to keep
-            
+
         Returns
         -------
-        mda.Universe
-            New universe with cropped chains
+        Tuple[mda.Universe, List[int], List[int]]
+            New universe with cropped chains, followed by the `keep` and
+            `replace` atom-index lists from `identify_chains_to_crop`
+            (the atoms retained, and those capped with a new H).
         """
         keep, delete, replace = self.identify_chains_to_crop(
             universe, chain_type, max_chain_length
