@@ -25,7 +25,9 @@ Console script `chain-cropper` (`chain_cropper.cli:main`):
 [--max-length N] [--cap-distance 1.09] [-j N_JOBS] [--batch] [-v]`.
 Structure-only or structure+trajectory modes; `--batch` processes all
 topology files found in the current directory. Output auto-named
-`<stem>_cropped<ext>` unless `-o` given.
+`<stem>_cropped<ext>` unless `-o` given — `-o` may be a directory (both
+outputs named `<stem>_cropped<ext>` inside it) or a single filename (see
+Known gaps for the file case's exact derivation rule).
 
 Python API — `ChainCropper(cap_distance=1.09)`:
 - `identify_chains_to_crop(universe, chain_type='alkyl', max_chain_length=1)`
@@ -61,20 +63,28 @@ output path's extension.
 
 ## Known gaps / TODOs
 
-- **Likely bug (not executed/confirmed this session), serial trajectory
-  path:** `TrajectoryProcessor._apply_cropping()` (line ~473) calls
-  `universe.add_TopologyAttr('name', names)` /
-  `add_TopologyAttr('element', elements)` unconditionally every time it
-  runs. `_write_trajectory()`'s serial branch (`n_jobs == 1`, line
-  ~626-632) calls `_apply_cropping(universe)` once per frame on the
-  *same* `universe` object — MDAnalysis raises `ValueError` when adding a
-  `TopologyAttr` that already exists, so this would plausibly crash on
-  the second frame of any multi-frame trajectory processed serially.
-  The parallel branch (`n_jobs != 1`) avoids this because it only calls
-  `_apply_cropping` once (for the first frame) and processes the rest via
-  the standalone `_process_frame()`, which doesn't touch `TopologyAttr`s.
-  Worth a real end-to-end test with a multi-frame trajectory + `-j 1`
-  before trusting the serial path.
+- **Investigated, did not reproduce:** the previously-flagged
+  "`add_TopologyAttr` crash in the serial (`-j 1`) trajectory path"
+  (repeated `_apply_cropping()` calls on the same `Universe` across
+  frames looked like they'd hit MDAnalysis's "attribute already exists"
+  error). Live-tested against a real 3-frame slice of a 49960-atom
+  trajectory (`poly_workflow/PM6/PM6_traj.trr`) with `-j 1` — completed
+  successfully across repeated attribute-add cycles, no crash. Not a
+  real bug as far as this test could tell; leave as-is.
+- **Fixed 2026-08-06:** `cli.py::generate_output_paths()` — when `-o`
+  pointed at a single file (not a directory) *and* both a topology and a
+  trajectory were given, the function assigned `-o`'s value straight to
+  the topology output slot regardless of its extension (e.g. `-o
+  cropped.trr` silently produced two trajectory-shaped outputs and no
+  cropped `.gro` at all — found live-testing the same PM6 trajectory
+  above; a cropped trajectory with no matching topology can't be opened
+  by anything, VMD included, since atom counts have to match). Fixed:
+  when both a topology and trajectory are present, both output paths are
+  now always derived from the *input* files' own extensions
+  (`<stem><input_suffix>` / `<stem>_traj<input_traj_suffix>`), never
+  from whatever extension the user's `-o` value happens to have. The
+  single-structure case (`-o` given, no trajectory) is unchanged — still
+  honors the user's exact filename, since there's no ambiguity there.
 - `chain_cropper`'s own `identify_chains_to_crop()` is actually the
   correct, working implementation of `ether`-aware chain identification
   (it genuinely includes oxygen atoms in the walk, unlike the similarly-named

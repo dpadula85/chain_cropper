@@ -125,12 +125,21 @@ def generate_output_paths(topology_path: Path, trajectory_path: Optional[Path],
             topo_out = output / f"{topology_path.stem}_cropped{topology_path.suffix}"
             traj_out = output / f"{trajectory_path.stem}_cropped{trajectory_path.suffix}" if trajectory_path else None
         else:
-            # Output is a file - use it for topology
-            topo_out = output
-            # Generate trajectory output with same name pattern
+            # Output is a single file.
             if trajectory_path:
+                # Both a topology and a trajectory output are needed from
+                # one -o value -- always derive both from the INPUT
+                # files' own extensions, not whatever extension -o
+                # happens to have. Using output's extension verbatim for
+                # the topology (e.g. `-o cropped.trr`) would silently
+                # produce a trajectory-shaped "topology" file and no
+                # actual cropped structure at all, leaving the cropped
+                # trajectory with no matching topology to open it with.
+                topo_out = output.parent / f"{output.stem}{topology_path.suffix}"
                 traj_out = output.parent / f"{output.stem}_traj{trajectory_path.suffix}"
             else:
+                # Single structure only -- honor the user's exact filename.
+                topo_out = output
                 traj_out = None
     else:
         # No output specified - use input directory with _cropped suffix
