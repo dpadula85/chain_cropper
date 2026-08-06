@@ -393,6 +393,12 @@ class TrajectoryProcessor(ChainCropper):
         self.keep_indices = None
         self.replace_indices = None
         self.delete_indices = None
+        # Indices, in the ORIGINAL structure's numbering, of the atoms that
+        # survive into the cropped structure, in the order they appear there.
+        # So cropped atom i corresponds to original atom final_indices[i].
+        # Populated by _apply_cropping; lets a caller carry per-atom data
+        # (e.g. real bonds read from a GROMACS topology) across the crop.
+        self.final_indices = None
     
     def process_trajectory(self, structure_file: str, output_path: str,
                           trajectory_file: Optional[str] = None,
@@ -524,6 +530,9 @@ class TrajectoryProcessor(ChainCropper):
         
         # Create selection
         keep_indices_sorted = sorted(list(atoms_to_keep))
+
+        # Record the cropped -> original index mapping (see __init__).
+        self.final_indices = np.asarray(keep_indices_sorted)
         
         # Update universe temporarily
         universe.atoms.positions = coords

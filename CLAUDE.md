@@ -44,6 +44,19 @@ Python API — `ChainCropper(cap_distance=1.09)`:
   `crystal_analyzer`'s own CLAUDE.md). **Fixed 2026-08-06:** docstring
   and return type hint corrected to document the actual 3-tuple return.
 
+`TrajectoryProcessor.final_indices` (**added 2026-08-06**) — after
+`_apply_cropping` has run, the ORIGINAL-structure indices of the atoms
+that survive into the cropped structure, in the order they appear there,
+so cropped atom `i` came from original atom `final_indices[i]`. Lets a
+caller carry per-atom data across the crop; `polymer_couplings` uses it
+to remap real bonds read from a GROMACS `.top` (which describes the
+*uncropped* system) onto the cropped structure, so nothing downstream has
+to guess bonds from geometry. The mapping is exact because cropping keeps
+atoms in sorted original-index order and *repurposes* a deleted heavy
+atom as each capping hydrogen rather than appending a new one — so every
+cropped atom, caps included, has an original index. Purely additive:
+nothing else reads it, and cropping behaviour is unchanged.
+
 `TrajectoryProcessor(ChainCropper)` — reuses cropping indices computed
 once from the topology across all trajectory frames;
 `process_trajectory(structure_file, output_path, trajectory_file=None,
