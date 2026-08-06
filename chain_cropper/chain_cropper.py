@@ -405,15 +405,16 @@ class TrajectoryProcessor(ChainCropper):
     
     def process_trajectory(self, structure_file: str, output_path: str,
                           trajectory_file: Optional[str] = None,
-                          chain_type: str = 'alkyl', 
+                          chain_type: str = 'alkyl',
                           max_chain_length: int = 1,
-                          n_jobs: int = -1) -> None:
+                          n_jobs: int = -1,
+                          structure_universe: Optional[mda.Universe] = None) -> None:
         """
         Process trajectory and write to file.
-        
+
         This method crops the structure once to determine which atoms to keep,
         then applies the same cropping to all frames in the trajectory.
-        
+
         Parameters
         ----------
         structure_file : str
@@ -429,24 +430,37 @@ class TrajectoryProcessor(ChainCropper):
         n_jobs : int, default=-1
             Number of parallel jobs for trajectory processing.
             -1 uses all available cores, 1 disables parallelization
+        structure_universe : Optional[MDAnalysis.Universe], default=None
+            Universe to take the connectivity from, instead of loading
+            `structure_file`. Pass one carrying real bonds -- read from a
+            GROMACS topology, say -- so which atoms count as side chain is
+            decided from the true connectivity rather than from bonds
+            guessed off the geometry. Guessing can both miss real bonds and
+            invent absent ones on a strained snapshot, and it is also the
+            slow step on a large system. `structure_file` is still used for
+            the coordinates and for pairing with the trajectory, so the two
+            must describe the same atoms in the same order.
         """
         from tqdm import tqdm
-        
+
         # Load structure to determine cropping indices
-        print(f"Loading structure from {structure_file}...")
-        structure_universe = mda.Universe(structure_file)
-        
+        if structure_universe is None:
+            print(f"Loading structure from {structure_file}...")
+            structure_universe = mda.Universe(structure_file)
+        else:
+            print("Using the supplied structure universe for connectivity")
+
         # Perform cropping analysis on structure only
         print("Analyzing chain structure...")
         keep, delete, replace = self.identify_chains_to_crop(
             structure_universe, chain_type, max_chain_length
         )
-        
+
         # Store indices for reuse
         self.keep_indices = keep
         self.delete_indices = delete
         self.replace_indices = replace
-        
+
         print(f"Identified {len(keep)} atoms to keep, {len(delete)} to delete, {len(replace)} to cap")
         
         # Create template cropped structure

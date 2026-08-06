@@ -44,6 +44,16 @@ Python API — `ChainCropper(cap_distance=1.09)`:
   `crystal_analyzer`'s own CLAUDE.md). **Fixed 2026-08-06:** docstring
   and return type hint corrected to document the actual 3-tuple return.
 
+`TrajectoryProcessor.process_trajectory(..., structure_universe=None)`
+(**added 2026-08-06**) — pass a Universe carrying real bonds (from a
+GROMACS topology, say) and the crop decides what counts as side chain
+from the true connectivity instead of guessing it off the geometry.
+Guessing both misses real bonds and invents absent ones on a strained MD
+snapshot, and it is the slow step on a large system. `structure_file` is
+still used for coordinates and for pairing with the trajectory, so the
+two must describe the same atoms in the same order. Purely additive: the
+default path is unchanged.
+
 `TrajectoryProcessor.final_indices` (**added 2026-08-06**) — after
 `_apply_cropping` has run, the ORIGINAL-structure indices of the atoms
 that survive into the cropped structure, in the order they appear there,
