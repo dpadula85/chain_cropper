@@ -7,11 +7,12 @@ structures, with support for trajectories, configurable chain lengths, and multi
 output formats.
 """
 
-import argparse
 import numpy as np
 import MDAnalysis as mda
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Dict, Set
+from typing import List, Optional, Sequence, Tuple
+
+from .topology import build_connectivity, side_chain_atoms, sp2_sp3
 
 
 class ChainCropper:
@@ -33,10 +34,21 @@ class ChainCropper:
         """
         self.cap_distance = cap_distance
         self.connectivity = None
+        # Number of bonds per atom. Read this instead of counting
+        # non-negative entries of a `connectivity` row: the row width now
+        # follows the most connected atom in the system, so a full row no
+        # longer means "four bonds".
+        self.degree = None
         self.heavy_atoms = None
         self.sp3_atoms = None
         self.oxygen_atoms = None
-    
+        # Boolean heavy-atom mask, kept alongside `connectivity` so the
+        # capping routine can tell a deleted heavy neighbour (which becomes
+        # a capping hydrogen) from a deleted hydrogen (which just goes).
+        self._is_heavy = None
+        # See TrajectoryProcessor.final_indices; populated by _build_cropped.
+        self.final_indices = None
+
     def _calculate_new_position(self, anchor_pos: np.ndarray, 
                               old_pos: np.ndarray, distance: float) -> np.ndarray:
         """
@@ -62,143 +74,140 @@ class ChainCropper:
     
     def _build_connectivity(self, universe: mda.Universe) -> np.ndarray:
         """
-        Build connectivity matrix from bonds.
-        
+        Build the neighbour matrix from bonds, and record the atom degrees.
+
+        Thin wrapper over `chain_cropper.topology.build_connectivity`, kept
+        so `self.connectivity`/`self.degree` are populated together.
+
         Parameters
         ----------
         universe : mda.Universe
             MDAnalysis universe object
-            
+
         Returns
         -------
         np.ndarray
-            Connectivity matrix with -1 as placeholder for empty valence
+            Neighbour matrix with -1 as placeholder for empty valence
         """
-        # Get or guess bonds
-        try:
-            bonds = universe.bonds.to_indices()
-        except (AttributeError, ValueError):
-            universe.atoms.guess_bonds()
-            bonds = universe.bonds.to_indices()
-        
-        # Initialize connectivity matrix
-        max_bonds = 4  # Assume maximum 4 bonds per atom
-        connectivity = np.full((len(universe.atoms), max_bonds), -1, dtype=int)
-        
-        # Fill connectivity matrix
-        for bond in bonds:
-            at1, at2 = bond
-            for j in range(max_bonds):
-                if connectivity[at1, j] == -1:
-                    connectivity[at1, j] = at2
-                    break
-            
-            for j in range(max_bonds):
-                if connectivity[at2, j] == -1:
-                    connectivity[at2, j] = at1
-                    break
-        
-        return connectivity
-    
+        self.connectivity, self.degree = build_connectivity(universe)
+
+        return self.connectivity
+
     def _identify_atom_types(self, universe: mda.Universe) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Identify different atom types in the universe.
-        
+
         Parameters
         ----------
         universe : mda.Universe
             MDAnalysis universe object
-            
+
         Returns
         -------
         Tuple[np.ndarray, np.ndarray, np.ndarray]
             Indices of heavy atoms, sp3 atoms, and oxygen atoms
         """
-        heavy_atoms = np.where(universe.atoms.types != "H")[0]
-        sp3_atoms = np.where(np.all(self.connectivity > -1, axis=1))[0]
-        oxygen_atoms = np.where(universe.atoms.types == "O")[0]
-        
+        types = np.asarray(universe.atoms.types, dtype=str)
+
+        self._is_heavy = types != "H"
+        heavy_atoms = np.flatnonzero(self._is_heavy)
+        _sp2, sp3_atoms = sp2_sp3(
+            universe, connectivity=self.connectivity, degree=self.degree
+        )
+        oxygen_atoms = np.flatnonzero(types == "O")
+
         return heavy_atoms, sp3_atoms, oxygen_atoms
-    
-    def _find_chain_from_terminus(self, start_atom: int, chain_type: str, 
-                                 max_length: int) -> List[int]:
+
+    def _cap_and_select(self, coords: np.ndarray, elements: np.ndarray,
+                        names: np.ndarray, keep: Sequence[int],
+                        delete: Sequence[int], replace: Sequence[int],
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
         """
-        Find a chain starting from a terminal atom.
-        
+        Turn each severed bond into a capping hydrogen.
+
+        Single home for the capping step, shared by `crop_chains`,
+        `TrajectoryProcessor._apply_cropping` and
+        `TrajectoryProcessor._process_frame`. It used to be copy-pasted into
+        all three, which is how the O(n) membership test below came to be
+        fixed in two of them and left in the third, and how the
+        one-cap-per-atom bug below came to be fixed in none.
+
+        A cap does not append a new atom: it *repurposes* the deleted heavy
+        atom's own index, moved in along the bond to `cap_distance`. That
+        keeps the original K-D bond valid, which is what lets a caller
+        remap per-atom data (and real bonds) across the crop via
+        `TrajectoryProcessor.final_indices`.
+
+        **Every** deleted heavy neighbour of a kept atom gets its own cap.
+        Capping only the first one left a quaternary side-chain carbon that
+        lost two substituents -- 9,9-dialkylfluorene and
+        indacenodithiophene being the everyday examples -- one hydrogen
+        short, with a dangling valence.
+
         Parameters
         ----------
-        start_atom : int
-            Starting atom index
-        chain_type : str
-            Type of chain to find
-        max_length : int
-            Maximum chain length
-            
+        coords, elements, names : np.ndarray
+            Per-atom arrays for the ORIGINAL (uncropped) atom set. Copied,
+            never modified in place.
+        keep, delete, replace : sequence of int
+            As returned by `identify_chains_to_crop`.
+
         Returns
         -------
-        List[int]
-            List of atom indices in the chain
+        coords, elements, names : np.ndarray
+            Copies with the capping hydrogens written in, still in the
+            original atom numbering.
+        keep_sorted : list of int
+            Original indices of the surviving atoms, ascending, capping
+            hydrogens included.
         """
-        if chain_type == 'alkyl':
-            valid_atoms = set(self.sp3_atoms)
-        elif chain_type == 'ether':
-            valid_atoms = set(np.concatenate([self.sp3_atoms, self.oxygen_atoms]))
-        else:
-            valid_atoms = set(self.sp3_atoms)
-        
-        chain = [start_atom]
-        current = start_atom
-        visited = {start_atom}
-        
-        while True:
-            # Find next atom in chain
-            connected = self.connectivity[current]
-            connected_valid = [idx for idx in connected 
-                             if idx >= 0 and idx in valid_atoms and idx not in visited]
-           
-            if not connected_valid:
-                break
-            
-            # Choose the first valid connected atom
-            next_atom = connected_valid[0]
+        coords = coords.copy()
+        elements = elements.copy()
+        names = names.copy()
 
-            if next_atom in visited:
-                break 
+        atoms_to_keep = set(int(i) for i in keep)
+        # Sets, not the incoming lists: this is a per-atom membership test in
+        # a loop, so a linear scan of the delete list makes the whole crop
+        # quadratic in system size.
+        delete_set = set(int(i) for i in delete)
 
-            chain.append(next_atom)
-            visited.add(next_atom)
-            current = next_atom
-        
-        return chain
-    
-    def _recursive_delete(self, atom_idx: int, keep_atoms: Set[int], 
-                         delete_atoms: Set[int], visited: Set[int]) -> None:
-        """
-        Recursively find all atoms connected to atom_idx that should be deleted.
-        
-        Parameters
-        ----------
-        atom_idx : int
-            Current atom index
-        keep_atoms : Set[int]
-            Set of atoms that must be kept
-        delete_atoms : Set[int]
-            Set of atoms to delete (modified in place)
-        visited : Set[int]
-            Set of already visited atoms (modified in place)
-        """
-        if atom_idx in visited or atom_idx in keep_atoms:
-            return
-            
-        visited.add(atom_idx)
-        delete_atoms.add(atom_idx)
-        
-        # Get all connected atoms
-        connected = self.connectivity[atom_idx]
-        for connected_atom in connected:
-            if connected_atom >= 0:  # Valid connection (not -1)
-                self._recursive_delete(connected_atom, keep_atoms, delete_atoms, visited)
-    
+        is_heavy = self._is_heavy
+        used: dict = {}
+
+        for atom_idx in replace:
+            atom_idx = int(atom_idx)
+
+            for neighbour in self.connectivity[atom_idx]:
+                neighbour = int(neighbour)
+
+                if neighbour < 0 or neighbour not in delete_set:
+                    continue
+
+                # A deleted hydrogen is not a severed bond to cap -- it went
+                # away because its heavy atom did.
+                if is_heavy is not None and not is_heavy[neighbour]:
+                    continue
+
+                if neighbour in used:
+                    raise ValueError(
+                        f"cannot cap: deleted atom {neighbour} sits between kept "
+                        f"atoms {used[neighbour]} and {atom_idx}, so both need a "
+                        f"capping hydrogen but only one atom index is free to "
+                        f"carry one. This happens when a saturated ring is cut "
+                        f"mid-ring; try a different max_chain_length."
+                    )
+                used[neighbour] = atom_idx
+
+                coords[neighbour] = self._calculate_new_position(
+                    coords[atom_idx], coords[neighbour], self.cap_distance
+                )
+                elements[neighbour] = 'H'
+                names[neighbour] = 'H'
+                atoms_to_keep.add(neighbour)
+
+        return coords, elements, names, sorted(atoms_to_keep)
+
+
     def identify_chains_to_crop(self, universe: mda.Universe, chain_type: str = 'alkyl',
                                max_chain_length: int = 1) -> Tuple[List[int], List[int], List[int]]:
         """
@@ -218,99 +227,98 @@ class ChainCropper:
         Tuple[List[int], List[int], List[int]]
             Lists of atom indices to keep, delete, and replace with H
         """
-        self.connectivity = self._build_connectivity(universe)
-        self.heavy_atoms, self.sp3_atoms, self.oxygen_atoms = self._identify_atom_types(universe)
-        
-        if chain_type == 'alkyl':
-            chain_atoms = self.sp3_atoms
-        elif chain_type == 'ether':
-            chain_atoms = np.concatenate([self.sp3_atoms, self.oxygen_atoms])
-        else:
-            chain_atoms = self.sp3_atoms
-        
-        keep_chain_atoms = []
-        delete_chain_atoms = []
-        
-        # Find terminal atoms (connected to non-chain atoms)
-        terminal_atoms = []
-        for atom_idx in chain_atoms:
-            connected = self.connectivity[atom_idx]
-            connected_heavy = connected[np.isin(connected, self.heavy_atoms)]
-            connected_heavy = connected_heavy[connected_heavy >= 0]
-            
-            # Check if connected to non-chain atoms
-            non_chain_connected = [idx for idx in connected_heavy if idx not in chain_atoms]
-            if non_chain_connected:
-                terminal_atoms.append(atom_idx)
-        
-        # Process each terminal atom to identify chain atoms to keep
-        processed = set()
-        for terminal in terminal_atoms:
-            if terminal in processed:
-                continue
-                
-            # Find chain from this terminal
-            chain = self._find_chain_from_terminus(terminal, chain_type, max_chain_length + 1)
-            
-            if len(chain) > max_chain_length:
-                # Keep first max_chain_length atoms
-                keep_chain_atoms.extend(chain[:max_chain_length])
-                delete_chain_atoms.extend(chain[max_chain_length:])
-            
-            processed.update(chain)
+        if max_chain_length < 0:
+            raise ValueError(
+                f"max_chain_length must be non-negative, got {max_chain_length}"
+            )
 
-        # All atoms that should be kept (core structure + chain atoms to keep)
-        all_atoms = set(range(len(universe.atoms)))
-        keep_atoms = set(keep_chain_atoms)
-        
-        # Add all non-chain atoms to keep set
-        for atom_idx in all_atoms:
-            if atom_idx not in chain_atoms:
-                keep_atoms.add(atom_idx)
-        
-        # Find atoms that need to be replaced (atoms in keep set that are connected to atoms not in keep set)
-        replace_atoms = []
-        delete_atoms = set()
-        
-        # Start with the identified chain atoms to delete
-        atoms_to_delete = set(delete_chain_atoms)
-        
-        # Recursively find all atoms connected to the delete_chain_atoms that should also be deleted
-        for atom_idx in delete_chain_atoms:
-            visited = set()
-            self._recursive_delete(atom_idx, keep_atoms, atoms_to_delete, visited)
-        
-        # Find replacement points - atoms in keep set connected to deleted atoms
-        for atom_idx in keep_chain_atoms:
-            connected = self.connectivity[atom_idx]
-            connected_atoms = [idx for idx in connected if idx >= 0]
-            
-            # Check if connected to any atom that will be deleted
-            has_deletable_connection = any(conn in atoms_to_delete for conn in connected_atoms)
-            
-            if has_deletable_connection:
-                replace_atoms.append(atom_idx)
-        
-        # Add all hydrogens connected to deleted heavy atoms.
-        # `universe.atoms.types` rebuilds the FULL per-atom type array from
-        # MDAnalysis's internal topology attributes on every access -- with
-        # this call inside the loop (once per deleted atom times up to 4
-        # connections), that rebuild dominated total runtime on a real
-        # ~58k-atom system (~20s of a ~36s crop, profiled). Hoisting it out
-        # to a single lookup array turns that into a cheap index, unrelated
-        # to the number of atoms being deleted.
-        atom_types = universe.atoms.types
-        all_atoms_to_delete = atoms_to_delete.copy()
-        for atom_idx in atoms_to_delete:
-            connected = self.connectivity[atom_idx]
-            for connected_atom in connected:
-                if connected_atom >= 0 and atom_types[connected_atom] == "H":
-                    all_atoms_to_delete.add(connected_atom)
-        
-        # Final keep set excludes all deleted atoms
-        final_keep_atoms = keep_atoms - all_atoms_to_delete
-        
-        return list(final_keep_atoms), list(all_atoms_to_delete), replace_atoms
+        n_atoms = len(universe.atoms)
+
+        self._build_connectivity(universe)
+        self.heavy_atoms, self.sp3_atoms, self.oxygen_atoms = \
+            self._identify_atom_types(universe)
+
+        connectivity = self.connectivity
+        is_heavy = self._is_heavy
+
+        is_chain = np.zeros(n_atoms, dtype=bool)
+        is_chain[side_chain_atoms(universe, chain_type,
+                                 connectivity, self.degree)] = True
+
+        # `connectivity` is -1-padded; `safe` lets a padded slot be used as an
+        # index into the per-atom masks without tripping negative indexing,
+        # and `valid` masks the result back out.
+        valid = connectivity >= 0
+        safe = np.where(valid, connectivity, 0)
+
+        # A side chain is entered from the core, so the walk starts at every
+        # chain atom bonded to a heavy atom that is not itself chain.
+        anchored = (valid & is_heavy[safe] & ~is_chain[safe]).any(axis=1)
+
+        # Breadth-first over the chain subgraph, recording how many chain
+        # atoms deep each one sits (the anchored atoms are depth 1). This
+        # replaces a single-path walk that followed only ONE branch out of
+        # each atom: a branched side chain (2-ethylhexyl, or the two alkyls
+        # of a 9,9-dialkylfluorene) left the unwalked branch classified as
+        # neither kept nor deleted, so it silently vanished from the output
+        # while its hydrogens stayed behind, unbonded.
+        depth = np.zeros(n_atoms, dtype=int)
+        frontier = np.flatnonzero(is_chain & anchored)
+        current_depth = 1
+
+        while frontier.size:
+            depth[frontier] = current_depth
+
+            neighbours = connectivity[frontier]
+            neighbours = np.unique(neighbours[neighbours >= 0])
+            frontier = neighbours[is_chain[neighbours] & (depth[neighbours] == 0)]
+            current_depth += 1
+
+        # Depth 0 chain atoms were never reached from any core anchor, i.e.
+        # they belong to an all-saturated molecule with no core to hang off
+        # (a solvent alkane, say). There is no side chain to trim there, so
+        # they are kept -- the old code dropped them.
+        delete_mask = is_chain & (depth > max_chain_length)
+
+        # Hydrogens of a deleted heavy atom go with it. Reading the heavy
+        # mask off `self._is_heavy` rather than `universe.atoms.types` keeps
+        # this off MDAnalysis's per-access attribute rebuild, which used to
+        # dominate the runtime of a large crop.
+        deleted = np.flatnonzero(delete_mask)
+        if deleted.size:
+            neighbours = connectivity[deleted]
+            neighbours = np.unique(neighbours[neighbours >= 0])
+            delete_mask[neighbours[~is_heavy[neighbours]]] = True
+
+        keep_mask = ~delete_mask
+
+        # A kept atom needs one capping hydrogen per deleted heavy neighbour.
+        # The old code only ever considered kept *chain* atoms here, so
+        # `max_chain_length=0` -- documented as "remove all side chains" --
+        # deleted every chain atom and then capped nothing at all, handing
+        # back a core full of dangling valences.
+        deleted_heavy = delete_mask & is_heavy
+        needs_cap = (valid & deleted_heavy[safe]).any(axis=1)
+        replace_atoms = np.flatnonzero(keep_mask & needs_cap)
+
+        # Each cap is carried by the deleted atom's own index, so a deleted
+        # atom bridging two kept atoms cannot cap both. Fail loudly rather
+        # than emit a structure that is quietly one hydrogen short.
+        bridging = np.flatnonzero(
+            deleted_heavy & ((valid & keep_mask[safe]).sum(axis=1) > 1)
+        )
+        if bridging.size:
+            raise ValueError(
+                f"cannot cap: {bridging.size} deleted atom(s) sit between two "
+                f"kept atoms (first is atom {int(bridging[0])}), so each would "
+                f"have to become two capping hydrogens. This happens when a "
+                f"saturated ring is cut mid-ring; try a different "
+                f"max_chain_length ({max_chain_length} was requested)."
+            )
+
+        return (np.flatnonzero(keep_mask).tolist(),
+                np.flatnonzero(delete_mask).tolist(),
+                replace_atoms.tolist())
 
     def crop_chains(self, universe: mda.Universe, chain_type: str = 'alkyl',
                    max_chain_length: int = 1) -> Tuple[mda.Universe, List[int], List[int]]:
@@ -332,58 +340,79 @@ class ChainCropper:
             New universe with cropped chains, followed by the `keep` and
             `replace` atom-index lists from `identify_chains_to_crop`
             (the atoms retained, and those capped with a new H).
+
+            The input universe is left untouched. It used to have its
+            positions, types and names overwritten in place, so a caller
+            that cropped and then went back to the original got the cropped
+            atom types instead.
         """
         keep, delete, replace = self.identify_chains_to_crop(
             universe, chain_type, max_chain_length
         )
-        
-        # Determine which atoms to keep in final structure
-        atoms_to_keep = set(keep)
-        
-        # Cap broken bonds
-        coords = universe.atoms.positions.copy()
-        elements = universe.atoms.types.copy()
-        names = universe.atoms.names.copy()
-        
-        delete_set = set(delete)  # O(1) membership below, not a scan of `delete` per check
-        for atom_idx in replace:
-            # Find the deleted atom it was connected to
-            connected = self.connectivity[atom_idx]
-            connected_atoms = [idx for idx in connected if idx >= 0]
 
-            deleted_connected = [idx for idx in connected_atoms if idx in delete_set]
-            if deleted_connected:
-                # Use the first deleted connection for positioning
-                deleted_atom = deleted_connected[0]
-                anchor_pos = coords[atom_idx]
-                old_pos = coords[deleted_atom]
-                
-                # Create new hydrogen at the deleted atom position
-                new_h_pos = self._calculate_new_position(anchor_pos, old_pos, self.cap_distance)
-                coords[deleted_atom] = new_h_pos
-                elements[deleted_atom] = 'H'
-                names[deleted_atom] = 'H'
-                
-                # Add the hydrogen back to atoms to keep
-                atoms_to_keep.add(deleted_atom)
-        
-        keep_indices = sorted(atoms_to_keep)
+        return self._build_cropped(universe, keep, delete, replace), keep, replace
 
-        # Update universe
-        universe.atoms.positions = coords
-        universe.atoms.types = elements
-        universe.atoms.names = names
+    def _build_cropped(self, universe: mda.Universe, keep: Sequence[int],
+                       delete: Sequence[int], replace: Sequence[int],
+                       ) -> mda.Universe:
+        """
+        Assemble the cropped universe: cap the severed bonds, keep the
+        surviving atoms, carry the unit cell over.
+
+        Shared by `crop_chains` and `TrajectoryProcessor._apply_cropping` so
+        the two cannot drift apart -- they previously wrote different
+        topology attributes, `crop_chains` setting `types` and
+        `_apply_cropping` setting `name`/`element`, so only one of the two
+        returned a universe with a usable `atoms.elements`.
+
+        Parameters
+        ----------
+        universe : mda.Universe
+            Source universe, read-only. Its currently loaded frame supplies
+            the coordinates and the box.
+        keep, delete, replace : sequence of int
+            As returned by `identify_chains_to_crop`.
+
+        Returns
+        -------
+        mda.Universe
+            The cropped structure, with `name`, `type` and `element` set.
+        """
+        coords, elements, names, keep_indices = self._cap_and_select(
+            universe.atoms.positions,
+            np.asarray(universe.atoms.types, dtype=object),
+            np.asarray(universe.atoms.names, dtype=object),
+            keep, delete, replace,
+        )
+
+        # Record the cropped -> original index mapping (see
+        # TrajectoryProcessor.final_indices).
+        self.final_indices = np.asarray(keep_indices)
 
         # Direct array indexing -- avoids building and parsing a selection
         # string with one token per atom, which does not scale to large
         # systems (tens of thousands of atoms).
-        selection = universe.atoms[keep_indices]
-        new_universe = mda.Merge(selection)
+        new_universe = mda.Merge(universe.atoms[keep_indices])
 
-        # mda.Merge does not carry the unit cell over (see _apply_cropping).
+        # Write the capped positions/labels onto the OUTPUT universe rather
+        # than onto the input, so cropping has no side effect on its
+        # argument.
+        new_universe.atoms.positions = coords[keep_indices]
+        kept_names = np.asarray([names[i] for i in keep_indices], dtype=str)
+        kept_elements = np.asarray([elements[i] for i in keep_indices], dtype=str)
+        new_universe.add_TopologyAttr('name', kept_names)
+        new_universe.add_TopologyAttr('type', kept_elements)
+        new_universe.add_TopologyAttr('element', kept_elements)
+
+        # mda.Merge does not carry the unit cell over, so without this the
+        # cropped structure comes out with no box at all and every
+        # PBC-aware calculation downstream silently becomes non-periodic.
+        # universe.dimensions is the box of the frame currently loaded, so
+        # this picks up that frame's box when called from the trajectory
+        # loop, and the structure's own box when called on a structure.
         new_universe.dimensions = universe.dimensions
 
-        return new_universe, keep, replace
+        return new_universe
 
 
 class TrajectoryProcessor(ChainCropper):
@@ -521,67 +550,12 @@ class TrajectoryProcessor(ChainCropper):
         """
         if self.keep_indices is None:
             raise RuntimeError("Must run identify_chains_to_crop first")
-        
-        # Work with copies
-        coords = universe.atoms.positions.copy()
-        elements = universe.atoms.types.copy()
-        names = universe.atoms.names.copy()
-        
-        atoms_to_keep = set(self.keep_indices)
-        delete_set = set(self.delete_indices)  # O(1) membership below, not a scan per check
 
-        # Cap broken bonds
-        for atom_idx in self.replace_indices:
-            # Find the deleted atom it was connected to
-            connected = self.connectivity[atom_idx]
-            connected_atoms = [idx for idx in connected if idx >= 0]
+        return self._build_cropped(
+            universe, self.keep_indices, self.delete_indices, self.replace_indices
+        )
 
-            deleted_connected = [idx for idx in connected_atoms
-                               if idx in delete_set]
 
-            if deleted_connected:
-                # Use the first deleted connection for positioning
-                deleted_atom = deleted_connected[0]
-                anchor_pos = coords[atom_idx]
-                old_pos = coords[deleted_atom]
-                
-                # Create new hydrogen at the deleted atom position
-                new_h_pos = self._calculate_new_position(
-                    anchor_pos, old_pos, self.cap_distance
-                )
-                coords[deleted_atom] = new_h_pos
-                elements[deleted_atom] = 'H'
-                names[deleted_atom] = 'H'
-                
-                # Add the hydrogen back to atoms to keep
-                atoms_to_keep.add(deleted_atom)
-        
-        keep_indices_sorted = sorted(atoms_to_keep)
-
-        # Record the cropped -> original index mapping (see __init__).
-        self.final_indices = np.asarray(keep_indices_sorted)
-
-        # Update universe temporarily
-        universe.atoms.positions = coords
-        universe.add_TopologyAttr('name', names)
-        universe.add_TopologyAttr('element', elements)
-
-        # Direct array indexing -- avoids building and parsing a selection
-        # string with one token per atom, which does not scale to large
-        # systems (tens of thousands of atoms).
-        selection = universe.atoms[keep_indices_sorted]
-        new_universe = mda.Merge(selection)
-
-        # mda.Merge does not carry the unit cell over, so without this the
-        # cropped structure comes out with no box at all and every
-        # PBC-aware calculation downstream silently becomes non-periodic.
-        # universe.dimensions is the box of the frame currently loaded, so
-        # this picks up that frame's box when called from the trajectory
-        # loop, and the structure's own box when called on a structure.
-        new_universe.dimensions = universe.dimensions
-
-        return new_universe
-    
     def _process_frame(self, frame_idx: int, coords: np.ndarray, 
                       elements: np.ndarray, names: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -603,37 +577,14 @@ class TrajectoryProcessor(ChainCropper):
         Tuple[np.ndarray, np.ndarray, np.ndarray]
             Cropped (coordinates, elements, names) for atoms to keep
         """
-        atoms_to_keep = set(self.keep_indices)
-        coords_copy = coords.copy()
-        elements_copy = elements.copy()
-        names_copy = names.copy()
-        
-        # Cap broken bonds
-        for atom_idx in self.replace_indices:
-            connected = self.connectivity[atom_idx]
-            connected_atoms = [idx for idx in connected if idx >= 0]
-            
-            deleted_connected = [idx for idx in connected_atoms 
-                               if idx in self.delete_indices]
-            if deleted_connected:
-                deleted_atom = deleted_connected[0]
-                anchor_pos = coords_copy[atom_idx]
-                old_pos = coords_copy[deleted_atom]
-                
-                # Create new hydrogen position
-                new_h_pos = self._calculate_new_position(
-                    anchor_pos, old_pos, self.cap_distance
-                )
-                coords_copy[deleted_atom] = new_h_pos
-                elements_copy[deleted_atom] = 'H'
-                names_copy[deleted_atom] = 'H'
-                atoms_to_keep.add(deleted_atom)
-        
-        # Return only data for atoms to keep
-        keep_indices_sorted = sorted(list(atoms_to_keep))
-        return (coords_copy[keep_indices_sorted], 
-                elements_copy[keep_indices_sorted],
-                names_copy[keep_indices_sorted])
+        coords, elements, names, keep_indices = self._cap_and_select(
+            coords, elements, names,
+            self.keep_indices, self.delete_indices, self.replace_indices,
+        )
+
+        return (coords[keep_indices],
+                elements[keep_indices],
+                names[keep_indices])
     
     def _write_trajectory(self, universe: mda.Universe, output_path: Path,
                          n_frames: int, n_jobs: int = -1) -> None:
