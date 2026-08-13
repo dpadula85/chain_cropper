@@ -291,12 +291,20 @@ class ChainCropper:
             if has_deletable_connection:
                 replace_atoms.append(atom_idx)
         
-        # Add all hydrogens connected to deleted heavy atoms
+        # Add all hydrogens connected to deleted heavy atoms.
+        # `universe.atoms.types` rebuilds the FULL per-atom type array from
+        # MDAnalysis's internal topology attributes on every access -- with
+        # this call inside the loop (once per deleted atom times up to 4
+        # connections), that rebuild dominated total runtime on a real
+        # ~58k-atom system (~20s of a ~36s crop, profiled). Hoisting it out
+        # to a single lookup array turns that into a cheap index, unrelated
+        # to the number of atoms being deleted.
+        atom_types = universe.atoms.types
         all_atoms_to_delete = atoms_to_delete.copy()
         for atom_idx in atoms_to_delete:
             connected = self.connectivity[atom_idx]
             for connected_atom in connected:
-                if connected_atom >= 0 and universe.atoms.types[connected_atom] == "H":
+                if connected_atom >= 0 and atom_types[connected_atom] == "H":
                     all_atoms_to_delete.add(connected_atom)
         
         # Final keep set excludes all deleted atoms
@@ -337,12 +345,13 @@ class ChainCropper:
         elements = universe.atoms.types.copy()
         names = universe.atoms.names.copy()
         
+        delete_set = set(delete)  # O(1) membership below, not a scan of `delete` per check
         for atom_idx in replace:
             # Find the deleted atom it was connected to
             connected = self.connectivity[atom_idx]
             connected_atoms = [idx for idx in connected if idx >= 0]
-            
-            deleted_connected = [idx for idx in connected_atoms if idx in delete]
+
+            deleted_connected = [idx for idx in connected_atoms if idx in delete_set]
             if deleted_connected:
                 # Use the first deleted connection for positioning
                 deleted_atom = deleted_connected[0]
@@ -358,16 +367,17 @@ class ChainCropper:
                 # Add the hydrogen back to atoms to keep
                 atoms_to_keep.add(deleted_atom)
         
-        # Create selection string
-        keep_indices = sorted(list(atoms_to_keep))
-        
+        keep_indices = sorted(atoms_to_keep)
+
         # Update universe
         universe.atoms.positions = coords
         universe.atoms.types = elements
         universe.atoms.names = names
-        
-        # Create new universe with selected atoms
-        selection = universe.select_atoms(f'index {" ".join(map(str, keep_indices))}')
+
+        # Direct array indexing -- avoids building and parsing a selection
+        # string with one token per atom, which does not scale to large
+        # systems (tens of thousands of atoms).
+        selection = universe.atoms[keep_indices]
         new_universe = mda.Merge(selection)
 
         # mda.Merge does not carry the unit cell over (see _apply_cropping).
@@ -518,15 +528,16 @@ class TrajectoryProcessor(ChainCropper):
         names = universe.atoms.names.copy()
         
         atoms_to_keep = set(self.keep_indices)
-        
+        delete_set = set(self.delete_indices)  # O(1) membership below, not a scan per check
+
         # Cap broken bonds
         for atom_idx in self.replace_indices:
             # Find the deleted atom it was connected to
             connected = self.connectivity[atom_idx]
             connected_atoms = [idx for idx in connected if idx >= 0]
-            
-            deleted_connected = [idx for idx in connected_atoms 
-                               if idx in self.delete_indices]
+
+            deleted_connected = [idx for idx in connected_atoms
+                               if idx in delete_set]
 
             if deleted_connected:
                 # Use the first deleted connection for positioning
@@ -545,21 +556,20 @@ class TrajectoryProcessor(ChainCropper):
                 # Add the hydrogen back to atoms to keep
                 atoms_to_keep.add(deleted_atom)
         
-        # Create selection
-        keep_indices_sorted = sorted(list(atoms_to_keep))
+        keep_indices_sorted = sorted(atoms_to_keep)
 
         # Record the cropped -> original index mapping (see __init__).
         self.final_indices = np.asarray(keep_indices_sorted)
-        
+
         # Update universe temporarily
         universe.atoms.positions = coords
         universe.add_TopologyAttr('name', names)
         universe.add_TopologyAttr('element', elements)
-        
-        # Create new universe with selected atoms
-        selection = universe.select_atoms(
-            f'index {" ".join(map(str, keep_indices_sorted))}'
-        )
+
+        # Direct array indexing -- avoids building and parsing a selection
+        # string with one token per atom, which does not scale to large
+        # systems (tens of thousands of atoms).
+        selection = universe.atoms[keep_indices_sorted]
         new_universe = mda.Merge(selection)
 
         # mda.Merge does not carry the unit cell over, so without this the

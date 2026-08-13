@@ -86,6 +86,25 @@ output path's extension.
 
 ## Known gaps / TODOs
 
+- **Real perf bug, fixed 2026-08-13: `identify_chains_to_crop` re-fetched
+  `universe.atoms.types` (MDAnalysis rebuilds the FULL per-atom type
+  array from its internal topology attributes on every access) inside a
+  loop over every deleted atom's connections — profiled at ~20s of a
+  ~36s crop on a real 58k-atom system (`polymer_couplings`' D18
+  reference), scaling with the number of deleted atoms, not a fixed
+  cost. Fixed by hoisting the array access out of the loop to a single
+  lookup. Two smaller instances of the same "repeated linear-scan
+  membership check" pattern fixed alongside it: `if idx in delete`
+  checked against a **list** (now a `set`) in both `crop_chains` and
+  `_apply_cropping`, and the final atom selection built a
+  space-separated `index i1 i2 i3 ...` selection string for MDAnalysis
+  to parse (now `universe.atoms[keep_indices]`, direct array indexing).
+  Net effect on the same 58k-atom system: ~36s → ~5.3s. Verified
+  behaviour-preserving via a new `tests/test_chain_cropper.py` (hand-
+  derived keep/delete/replace sets on a small synthetic molecule,
+  passing both before and after the fix) and by re-running
+  `polymer_couplings`' own non-slow suite (274 passed, unaffected).
+
 - **Real bug, fixed 2026-08-06: the unit cell was dropped.** Both
   `crop_chains` and `_apply_cropping` build the cropped structure with
   `mda.Merge`, which does not carry the box over, and nothing restored
