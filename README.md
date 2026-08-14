@@ -310,7 +310,7 @@ You can override this by specifying `-o` with an explicit filename or directory.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the GNU General Public License v3.0 or later - see the LICENSE file for details.
 
 ## Citation
 

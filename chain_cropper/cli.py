@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .chain_cropper import TrajectoryProcessor
+from .instrumentation import add_instrumentation_args, apply_instrumentation_args
 
 try:
     import MDAnalysis as mda
@@ -20,23 +21,6 @@ except ImportError:
     print("Error: MDAnalysis is required but not installed.")
     print("Please install it with: pip install MDAnalysis")
     sys.exit(1)
-
-
-def setup_logging(verbose: bool = False) -> None:
-    """
-    Set up logging configuration.
-    
-    Parameters
-    ----------
-    verbose : bool
-        Enable verbose logging
-    """
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
 
 
 def validate_input_file(filepath: str) -> Path:
@@ -207,9 +191,9 @@ Examples:
     # Mode options
     parser.add_argument('--batch', action='store_true',
                        help='Process all topology files in current directory')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                       help='Enable verbose output')
-    
+
+    add_instrumentation_args(parser)
+
     # Version
     try:
         from . import __version__
@@ -257,42 +241,42 @@ def process_single_file(topology_path: Path, trajectory_path: Optional[Path],
         topo_output, traj_output = generate_output_paths(
             topology_path, trajectory_path, output_arg
         )
-        
-        logger.info(f"Loading structure from {topology_path}")
-        
+
         # Initialize processor
         processor = TrajectoryProcessor(cap_distance=cap_distance)
-        
-        # Process structure (always)
+
+        # Analyse once, then write the structure. `process_trajectory` below
+        # re-derives the same (structure, chain_type, max_length) key and
+        # hits the cache, so the expensive analysis step never runs twice.
         logger.info(f"Processing structure with chain_type={chain_type}, max_length={max_length}")
-        processor.process_trajectory(
+        structure_universe = processor.analyze(
             structure_file=str(topology_path),
-            output_path=str(topo_output),
-            trajectory_file=None,
             chain_type=chain_type,
             max_chain_length=max_length,
-            n_jobs=1  # Structure processing doesn't need parallelization
         )
+        processor.write_structure(structure_universe, topo_output)
         logger.info(f"Cropped structure written to {topo_output}")
-        
+
         # Process trajectory if provided
         if trajectory_path:
             logger.info(f"Processing trajectory from {trajectory_path}")
             if n_jobs != 1:
                 logger.info(f"Using {n_jobs if n_jobs > 0 else 'all available'} CPU cores for parallel processing")
-            # Reuse same processor (indices already determined)
             processor.process_trajectory(
                 structure_file=str(topology_path),
                 output_path=str(traj_output),
                 trajectory_file=str(trajectory_path),
                 chain_type=chain_type,
                 max_chain_length=max_length,
-                n_jobs=n_jobs
+                n_jobs=n_jobs,
+                structure_universe=structure_universe,
             )
             logger.info(f"Cropped trajectory written to {traj_output}")
-        
+
+        processor.timing.log_summary()
+
         return True
-        
+
     except Exception as e:
         logger.error(f"Error processing {topology_path}: {e}")
         if logger.level == logging.DEBUG:
@@ -411,8 +395,9 @@ def main() -> int:
     parser = create_cli_parser()
     args = parser.parse_args()
     
-    # Set up logging
-    setup_logging(args.verbose)
+    # Set up logging -- file only, deliberately no console handler; the
+    # console is reserved for the tqdm bars in TrajectoryProcessor.
+    apply_instrumentation_args(args)
     logger = logging.getLogger(__name__)
     
     # Validate arguments

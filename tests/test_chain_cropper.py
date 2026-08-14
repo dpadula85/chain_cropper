@@ -486,3 +486,78 @@ def test_process_trajectory_writes_structure(propyl, tmp_path):
     assert output.exists()
     written = mda.Universe(str(output))
     assert written.atoms.n_atoms == 5
+
+
+# --------------------------------------------------------------------------
+# analyze() caching (chain_cropper plan Part A1)
+# --------------------------------------------------------------------------
+
+def test_analyze_reuses_cache_for_same_universe_and_params(propyl):
+    """
+    A second `analyze()` call for the same universe/chain_type/max_length
+    must not re-run `identify_chains_to_crop` -- that call is what the
+    CLI's structure-then-trajectory pair used to pay for twice.
+    """
+    processor = TrajectoryProcessor(cap_distance=CAP_DISTANCE)
+    processor.analyze(chain_type="alkyl", max_chain_length=1,
+                       structure_universe=propyl)
+    keep_first = processor.keep_indices
+
+    calls = []
+    original = processor.identify_chains_to_crop
+    processor.identify_chains_to_crop = lambda *a, **k: calls.append(1) or original(*a, **k)
+
+    processor.analyze(chain_type="alkyl", max_chain_length=1,
+                       structure_universe=propyl)
+
+    assert calls == []
+    assert processor.keep_indices == keep_first
+
+
+def test_analyze_reanalyses_when_max_chain_length_changes(propyl):
+    """
+    Reusing one processor with a DIFFERENT max_chain_length must
+    re-analyse rather than silently serving the previous call's indices --
+    a naive `if self.keep_indices is None` cache guard would get this
+    wrong.
+    """
+    processor = TrajectoryProcessor(cap_distance=CAP_DISTANCE)
+    processor.analyze(chain_type="alkyl", max_chain_length=1,
+                       structure_universe=propyl)
+    keep_len1 = list(processor.keep_indices)
+
+    processor.analyze(chain_type="alkyl", max_chain_length=0,
+                       structure_universe=propyl)
+    keep_len0 = list(processor.keep_indices)
+
+    assert keep_len1 != keep_len0
+    assert keep_len0 == [0]
+
+
+def test_analyze_reuses_cache_across_structure_file_and_returned_universe(
+        propyl, tmp_path, monkeypatch):
+    """
+    The CLI's real usage pattern: `analyze()` once by path (which loads a
+    Universe), then a second call that passes back the very Universe
+    object the first call returned. A cache keyed inconsistently on id()
+    vs. path (one per call style) would miss this and silently redo the
+    bond-guessing analysis on the second, in-process call.
+    """
+    gro = tmp_path / "propyl.gro"
+    propyl.atoms.write(str(gro))
+
+    processor = TrajectoryProcessor(cap_distance=CAP_DISTANCE)
+    universe = processor.analyze(structure_file=str(gro), chain_type="alkyl",
+                                  max_chain_length=1)
+
+    calls = []
+    original = processor.identify_chains_to_crop
+    processor.identify_chains_to_crop = lambda *a, **k: calls.append(1) or original(*a, **k)
+
+    same_universe = processor.analyze(
+        structure_file=str(gro), chain_type="alkyl", max_chain_length=1,
+        structure_universe=universe,
+    )
+
+    assert calls == []
+    assert same_universe is universe

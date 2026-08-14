@@ -15,11 +15,12 @@ setup(
     long_description_content_type='text/markdown',
     url='https://github.com/dpadula85/chain_cropper',
     packages=find_packages(),
+    license='GPL-3.0-or-later',
     classifiers=[
         'Intended Audience :: Science/Research',
         'Topic :: Scientific/Engineering :: Chemistry',
         'Topic :: Scientific/Engineering :: Bio-Informatics',
-        'License :: OSI Approved :: MIT License',
+        'License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',

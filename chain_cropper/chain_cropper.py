@@ -7,12 +7,16 @@ structures, with support for trajectories, configurable chain lengths, and multi
 output formats.
 """
 
+import logging
 import numpy as np
 import MDAnalysis as mda
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from .topology import build_connectivity, side_chain_atoms, sp2_sp3
+from .instrumentation import TimingSummary
+
+log = logging.getLogger(__name__)
 
 
 class ChainCropper:
@@ -441,7 +445,113 @@ class TrajectoryProcessor(ChainCropper):
         # Populated by _apply_cropping; lets a caller carry per-atom data
         # (e.g. real bonds read from a GROMACS topology) across the crop.
         self.final_indices = None
+        # Identity of the analysis currently cached in
+        # keep/delete/replace_indices -- see `analyze`.
+        self._analysis_params = None
+        self._analyzed_structure_path = None
+        self._analyzed_universe = None
+        self.timing = TimingSummary()
     
+    def analyze(self, structure_file: Optional[str] = None,
+                chain_type: str = 'alkyl', max_chain_length: int = 1,
+                structure_universe: Optional[mda.Universe] = None) -> mda.Universe:
+        """
+        Determine which atoms to keep/delete/cap, caching the result.
+
+        A repeat call with the same structure identity, chain_type and
+        max_chain_length returns the cached universe and skips
+        `identify_chains_to_crop` -- the expensive step, dominated by bond
+        guessing on a large system. Keyed on all three, not just "has this
+        run once", so reusing one processor with a different
+        `max_chain_length` still re-analyses instead of serving stale
+        indices.
+
+        Parameters
+        ----------
+        structure_file : Optional[str]
+            Input structure file. Ignored if `structure_universe` is given.
+        chain_type : str, default='alkyl'
+        max_chain_length : int, default=1
+        structure_universe : Optional[MDAnalysis.Universe], default=None
+            Pass one carrying real bonds instead of loading `structure_file`
+            -- see `process_trajectory`'s docstring for why.
+
+        Returns
+        -------
+        mda.Universe
+            The universe the analysis ran against.
+        """
+        if structure_universe is None and structure_file is None:
+            raise ValueError("Must supply structure_file or structure_universe")
+
+        params = (chain_type, max_chain_length)
+        resolved_path = (
+            str(Path(structure_file).resolve()) if structure_file is not None else None
+        )
+
+        # A hit needs the SAME universe object previously analyzed, identified
+        # by id (if handed one directly) or by its load path (if not) -- a
+        # caller can reasonably do either on a repeat call, e.g. cli.py loads
+        # by path once, then passes the returned object back in explicitly.
+        cached = (self._analyzed_universe is not None and params == self._analysis_params)
+        if cached and structure_universe is not None:
+            cached = id(structure_universe) == id(self._analyzed_universe)
+        elif cached:
+            cached = resolved_path == self._analyzed_structure_path
+
+        if cached:
+            log.debug("Reusing cached analysis for %s", params)
+            return self._analyzed_universe
+
+        if structure_universe is None:
+            with self.timing.measure("structure_load"):
+                log.info("Loading structure from %s...", structure_file)
+                structure_universe = mda.Universe(structure_file)
+        else:
+            log.info("Using the supplied structure universe for connectivity")
+
+        with self.timing.measure("analysis"):
+            log.info("Analyzing chain structure...")
+            keep, delete, replace = self.identify_chains_to_crop(
+                structure_universe, chain_type, max_chain_length
+            )
+
+        self.keep_indices = keep
+        self.delete_indices = delete
+        self.replace_indices = replace
+        self._analysis_params = params
+        self._analyzed_structure_path = resolved_path
+        self._analyzed_universe = structure_universe
+
+        log.info("Identified %d atoms to keep, %d to delete, %d to cap",
+                  len(keep), len(delete), len(replace))
+
+        return structure_universe
+
+    def write_structure(self, universe: mda.Universe, output_path: Path) -> mda.Universe:
+        """
+        Crop `universe` with the currently cached indices and write it out.
+
+        Parameters
+        ----------
+        universe : mda.Universe
+            Universe to crop (must have the same atom count as the one
+            `analyze` ran against).
+        output_path : Path
+            Where to write the cropped structure.
+
+        Returns
+        -------
+        mda.Universe
+            The cropped structure.
+        """
+        with self.timing.measure("structure_write"):
+            cropped = self._apply_cropping(universe)
+            log.info("Writing cropped structure to %s...", output_path)
+            cropped.atoms.write(str(output_path))
+
+        return cropped
+
     def process_trajectory(self, structure_file: str, output_path: str,
                           trajectory_file: Optional[str] = None,
                           chain_type: str = 'alkyl',
@@ -480,60 +590,39 @@ class TrajectoryProcessor(ChainCropper):
             the coordinates and for pairing with the trajectory, so the two
             must describe the same atoms in the same order.
         """
-        from tqdm import tqdm
-
-        # Load structure to determine cropping indices
-        if structure_universe is None:
-            print(f"Loading structure from {structure_file}...")
-            structure_universe = mda.Universe(structure_file)
-        else:
-            print("Using the supplied structure universe for connectivity")
-
-        # Perform cropping analysis on structure only
-        print("Analyzing chain structure...")
-        keep, delete, replace = self.identify_chains_to_crop(
-            structure_universe, chain_type, max_chain_length
+        structure_universe = self.analyze(
+            structure_file=structure_file, chain_type=chain_type,
+            max_chain_length=max_chain_length, structure_universe=structure_universe,
         )
 
-        # Store indices for reuse
-        self.keep_indices = keep
-        self.delete_indices = delete
-        self.replace_indices = replace
-
-        print(f"Identified {len(keep)} atoms to keep, {len(delete)} to delete, {len(replace)} to cap")
-        
-        # Create template cropped structure
-        cropped_structure = self._apply_cropping(structure_universe)
-        
-        # Determine output format
         output_path = Path(output_path)
-        extension = output_path.suffix.lower()
-        
+
         # If no trajectory, just write the structure
         if trajectory_file is None:
-            print(f"Writing cropped structure to {output_path}...")
-            cropped_structure.atoms.write(str(output_path))
-            print("Done!")
+            self.write_structure(structure_universe, output_path)
+            log.info("Done!")
             return
-        
+
         # Load universe with trajectory
-        print(f"Loading trajectory from {trajectory_file}...")
-        traj_universe = mda.Universe(structure_file, trajectory_file)
-        n_frames = len(traj_universe.trajectory)
-        print(f"Processing {n_frames} frames...")
-        
+        with self.timing.measure("trajectory_load"):
+            log.info("Loading trajectory from %s...", trajectory_file)
+            traj_universe = mda.Universe(structure_file, trajectory_file)
+            n_frames = len(traj_universe.trajectory)
+        log.info("Processing %d frames...", n_frames)
+
+        extension = output_path.suffix.lower()
+
         # Write trajectory or single frame
         if extension in ['.xtc', '.trr', '.dcd']:
             self._write_trajectory(traj_universe, output_path, n_frames, n_jobs)
         elif extension in ['.xyz', '.gro', '.pdb']:
             # Just write the first frame
             traj_universe.trajectory[0]
-            cropped_frame = self._apply_cropping(traj_universe)
-            cropped_frame.atoms.write(str(output_path))
-            print("Done!")
+            self.write_structure(traj_universe, output_path)
+            log.info("Done!")
         else:
             raise ValueError(f"Unsupported output format: {extension}")
-    
+
     def _apply_cropping(self, universe: mda.Universe) -> mda.Universe:
         """
         Apply stored cropping indices to a universe.
@@ -604,68 +693,76 @@ class TrajectoryProcessor(ChainCropper):
             1 disables parallelization
         """
         from tqdm import tqdm
+        from tqdm.contrib.logging import logging_redirect_tqdm
         from joblib import Parallel, delayed
         import multiprocessing as mp
-        
+
         # Process first frame to get structure info
         universe.trajectory[0]
         first_cropped = self._apply_cropping(universe)
         n_atoms = len(first_cropped.atoms)
-        
+
         # Determine number of jobs
         if n_jobs == -1:
             n_jobs = mp.cpu_count()
         elif n_jobs < 1:
             n_jobs = 1
-        
-        print(f"Processing {n_frames} frames using {n_jobs} core(s)...")
-        
+
+        log.info("Processing %d frames using %d core(s)...", n_frames, n_jobs)
+
         if n_jobs == 1:
             # Serial processing
-            with mda.Writer(str(output_path), n_atoms) as writer:
-                for ts in tqdm(universe.trajectory, total=n_frames, 
+            with mda.Writer(str(output_path), n_atoms) as writer, \
+                    logging_redirect_tqdm():
+                for ts in tqdm(universe.trajectory, total=n_frames,
                               desc="Writing trajectory", unit="frame"):
-                    cropped_frame = self._apply_cropping(universe)
-                    writer.write(cropped_frame.atoms)
+                    with self.timing.measure("per_frame_cropping"):
+                        cropped_frame = self._apply_cropping(universe)
+                    with self.timing.measure("trajectory_write"):
+                        writer.write(cropped_frame.atoms)
         else:
             # Parallel processing
             # First, load all coordinates into memory
-            print("Loading trajectory into memory...")
+            log.info("Loading trajectory into memory...")
             all_coords = []
             all_dimensions = []
             elements = universe.atoms.types.copy()
             names = universe.atoms.names.copy()
 
-            for ts in tqdm(universe.trajectory, total=n_frames,
-                          desc="Loading frames", unit="frame"):
-                all_coords.append(universe.atoms.positions.copy())
-                # Each frame keeps its own box: under NPT the cell
-                # fluctuates, so the structure file's box must not be
-                # reused for every frame.
-                all_dimensions.append(
-                    None if ts.dimensions is None else ts.dimensions.copy()
-                )
-            
+            with self.timing.measure("trajectory_load"), logging_redirect_tqdm():
+                for ts in tqdm(universe.trajectory, total=n_frames,
+                              desc="Loading frames", unit="frame"):
+                    all_coords.append(universe.atoms.positions.copy())
+                    # Each frame keeps its own box: under NPT the cell
+                    # fluctuates, so the structure file's box must not be
+                    # reused for every frame.
+                    all_dimensions.append(
+                        None if ts.dimensions is None else ts.dimensions.copy()
+                    )
+
             # Process frames in parallel
-            print(f"Processing frames in parallel with {n_jobs} workers...")
-            processed_frames = Parallel(n_jobs=n_jobs)(
-                delayed(self._process_frame)(i, coords, elements, names)
-                for i, coords in enumerate(tqdm(all_coords, 
-                                               desc="Processing frames",
-                                               unit="frame"))
-            )
-            
+            log.info("Processing frames in parallel with %d workers...", n_jobs)
+            with self.timing.measure("per_frame_cropping"), logging_redirect_tqdm():
+                processed_frames = Parallel(n_jobs=n_jobs)(
+                    delayed(self._process_frame)(i, coords, elements, names)
+                    for i, coords in enumerate(tqdm(all_coords,
+                                                   desc="Processing frames",
+                                                   unit="frame"))
+                )
+
             # Write processed frames
-            print("Writing trajectory...")
-            with mda.Writer(str(output_path), n_atoms) as writer:
+            log.info("Writing trajectory...")
+            with self.timing.measure("trajectory_write"), \
+                    mda.Writer(str(output_path), n_atoms) as writer, \
+                    logging_redirect_tqdm():
                 # Create temporary universe for writing
-                temp_u = mda.Universe.empty(n_atoms, 
+                temp_u = mda.Universe.empty(n_atoms,
                                            n_residues=1,
                                            atom_resindex=[0]*n_atoms,
                                            trajectory=True)
                 temp_u.add_TopologyAttr('type', processed_frames[0][1])
                 temp_u.add_TopologyAttr('name', processed_frames[0][2])
-                
+
                 for (coords, elements, names), dimensions in tqdm(
                         zip(processed_frames, all_dimensions),
                         total=len(processed_frames),
@@ -677,8 +774,8 @@ class TrajectoryProcessor(ChainCropper):
                     if dimensions is not None:
                         temp_u.dimensions = dimensions
                     writer.write(temp_u.atoms)
-        
-        print(f"Trajectory written to {output_path}")
+
+        log.info("Trajectory written to %s", output_path)
 
 
 # Example usage
