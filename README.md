@@ -1,4 +1,17 @@
+<div align="center">
+
 # ChainCropper
+
+**Crop molecular side chains from structures and trajectories**
+
+[![tests](https://github.com/dpadula85/chain_cropper/actions/workflows/tests.yml/badge.svg)](https://github.com/dpadula85/chain_cropper/actions/workflows/tests.yml)
+[![version](https://img.shields.io/badge/version-0.1-blue)](setup.py)
+[![python](https://img.shields.io/badge/python-3.9%2B-blue)](setup.py)
+[![license](https://img.shields.io/badge/license-GPLv3%2B-blue)](LICENSE)
+
+</div>
+
+---
 
 A Python package for cropping molecular side chains from structures and trajectories using MDAnalysis.
 
